@@ -43,6 +43,7 @@ module Data.HashMap.Strict.Base
     , (!)
     , insert
     , insertWith
+    , insertWithM
     , delete
     , adjust
     , update
@@ -178,6 +179,67 @@ insertWith f k0 v0 m0 = go h0 k0 v0 0 m0
         | h == hy   = Collision h (updateOrSnocWith f k x v)
         | otherwise = go h k x s $ BitmapIndexed (mask hy s) (A.singleton t)
 {-# INLINABLE insertWith #-}
+
+-- Support for mutable values in the hashmap. This can be useful when we
+-- frequently update the values in the map. A mutable reference and mutable
+-- updation function can allow updation without mutating the hashmap, thus
+-- providing good performance in such cases. Only insertion requires mutation
+-- of the hashmap.
+--  XXX Use SPEC
+{-# INLINABLE insertWithM #-}
+insertWithM :: (Eq k, Hashable k, Monad m)
+    => (k -> a -> m v) -> (v -> k -> a -> m ()) -> k -> a
+    -> HashMap k v -> m (HashMap k v)
+insertWithM fInsert fUpdate k0 v0 m0 =  do
+    r <- go h0 k0 v0 0 m0
+    case r of
+        Just x -> return x
+        Nothing -> return m0
+  where
+    h0 = hash k0
+    go !h !k x !_ Empty = do
+        mutRef <- x `seq` fInsert k x
+        mutRef `seq` return $ Just $ leaf h k mutRef
+    go h k x s t@(Leaf hy l@(L ky y))
+        | hy == h = if ky == k
+                    then fUpdate y k x >> return Nothing
+                    else do
+                        mutRef <- x `seq` fInsert k x
+                        return $ Just $ (collision h l (L k mutRef))
+        | otherwise = do
+            mutRef <- x `seq` fInsert k x
+            return $ Just $ runST (two s h k mutRef hy t)
+    go h k x s (BitmapIndexed b ary)
+        | b .&. m == 0 = do
+            mutRef <- x `seq` fInsert k x
+            return $ let ary' = A.insert ary i $! leaf h k mutRef
+                      in Just $ bitmapIndexedOrFull (b .|. m) ary'
+        | otherwise = do
+            let st   = A.index ary i
+            st'  <- go h k x (s+bitsPerSubkey) st
+            case st' of
+                Just hm ->
+                    return $ let ary' = A.update ary i $! hm
+                              in Just $ BitmapIndexed b ary'
+                Nothing -> return Nothing
+      where m = mask h s
+            i = sparseIndex b m
+    go h k x s (Full ary) = do
+        let st   = A.index ary i
+        st'  <- go h k x (s+bitsPerSubkey) st
+        case st' of
+            Just hm -> do
+                let ary' = update16 ary i $! hm
+                return $ Just $ Full ary'
+            Nothing -> return Nothing
+      where i = index h s
+    go h k x s t@(Collision hy v)
+        | h == hy   = do
+            res <- updateOrSnocWithKeyM fInsert fUpdate k x v
+            case res of
+                Just arr -> return $ Just $ Collision h arr
+                Nothing -> return Nothing
+        | otherwise = go h k x s $ BitmapIndexed (mask hy s) (A.singleton t)
 
 -- | In-place update version of insertWith
 unsafeInsertWith :: (Eq k, Hashable k) => (v -> v -> v) -> k -> v -> HashMap k v
@@ -659,6 +721,47 @@ updateOrSnocWithKey f k0 v0 ary0 = go k0 v0 ary0 0 (A.length ary0)
             (L kx y) | k == kx   -> let !v' = f k v y in A.update ary i (L k v')
                      | otherwise -> go k v ary (i+1) n
 {-# INLINABLE updateOrSnocWithKey #-}
+
+-- When we are inserting values in a hasmap in a loop, we may have the keys and
+-- values in a format which is most efficient for stream processing, but when
+-- we insetr them in a hashmap we may need them to be in a format which is most
+-- efficient for long term storage. For this we can first lookup the old value
+-- and then insert. But that requires traversing the hashmap twice.
+--
+-- If we use insertWith it needs to first convert the values and we may not
+-- even insert the key because it is already there. For example, we may want to
+-- keep the values as mutable IORef, if we need to update we do not need to
+-- create a IORef in the first place, we only need to create it during the
+-- first insert. Creating an IORef every time may be a big overhead.
+--
+-- Therefore, we need separate functions to convert the values during:
+-- insert
+-- update
+
+-- XXX Use SPEC
+
+{-# INLINABLE updateOrSnocWithKeyM #-}
+updateOrSnocWithKeyM :: (Eq k, Monad m)
+    => (k -> a -> m v) -> (v -> k -> a -> m ()) -> k -> a
+    -> A.Array (Leaf k v) -> m (Maybe (A.Array (Leaf k v)))
+updateOrSnocWithKeyM fInsert fUpdate k0 v0 ary0 =
+    go k0 v0 ary0 0 (A.length ary0)
+  where
+    go !k v !ary !i !n
+        | i >= n = do
+            v1 <- v `seq` fInsert k v
+            return $ Just $ A.run $ do
+                -- Not found, append to the end.
+                mary <- A.new_ (n + 1)
+                A.copy ary 0 mary 0 n
+                let !l = v1 `seq` (L k v1)
+                A.write mary n l
+                return mary
+        | otherwise = case A.index ary i of
+            (L kx y) | k == kx   -> do
+                        fUpdate y k v
+                        return Nothing
+                     | otherwise -> go k v ary (i+1) n
 
 ------------------------------------------------------------------------
 -- Smart constructors

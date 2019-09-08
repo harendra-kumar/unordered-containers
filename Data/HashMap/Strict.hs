@@ -41,6 +41,7 @@ module Data.HashMap.Strict
     , (!)
     , insert
     , insertWith
+    , insertWithM
     , delete
     , adjust
     , update
